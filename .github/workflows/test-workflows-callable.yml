@@ -108,23 +108,6 @@ jobs:
         run: |
           echo "Attempting to send test results to webhook..."
           echo "Test results file expected at: $TEST_RESULTS_FILE"
-
-          if [ ! -f "$TEST_RESULTS_FILE" ]; then
-            echo "::warning::Test results file ($TEST_RESULTS_FILE) not found. Skipping webhook."
-            exit 0
-          fi
-
-          if ! command -v jq &> /dev/null; then
-            echo "jq not found. Installing jq..."
-            sudo apt-get update -qq && sudo apt-get install -y -qq jq
-            if ! command -v jq &> /dev/null; then
-              echo "::error::Failed to install jq. Cannot process JSON."
-              exit 1
-            fi
-          fi
-
-          pr_number_to_send="$GH_PR_NUMBER_INPUT"
-
           echo "Preparing JSON payload..."
           if [ ! -s "$TEST_RESULTS_FILE" ]; then
             echo "::warning::Test results file ($TEST_RESULTS_FILE) is empty. Sending only GitHub context."
@@ -148,8 +131,16 @@ jobs:
                   workflowRunUrl: $workflow_run_url,
                   triggeredBy: $actor
                 }
-              }')
+              }' 2>jq_errors.txt)
           else
+            # Validate JSON before processing
+            if ! jq empty "$TEST_RESULTS_FILE" 2>/dev/null; then
+              echo "::error::Test results file contains invalid JSON"
+              echo "First 1000 chars of file:"
+              head -c 1000 "$TEST_RESULTS_FILE"
+              exit 1
+            fi
+
             enriched_payload=$(jq \
               --arg repository "$GH_REPOSITORY" \
               --arg run_id "$GH_RUN_ID" \
@@ -170,45 +161,44 @@ jobs:
                   workflowRunUrl: $workflow_run_url,
                   triggeredBy: $actor
                 }
-              }' "$TEST_RESULTS_FILE")
+              }' "$TEST_RESULTS_FILE" 2>jq_errors.txt)
           fi
 
           jq_exit_code=$?
+
+          # Check for jq errors
+          if [ -s jq_errors.txt ]; then
+            echo "::error::JQ processing errors:"
+            cat jq_errors.txt
+          fi
+
           if [ $jq_exit_code -ne 0 ] || [ -z "$enriched_payload" ]; then
             echo "::error::Failed to process JSON with jq (exit code: $jq_exit_code). Input file: $TEST_RESULTS_FILE"
             if [ -s "$TEST_RESULTS_FILE" ]; then
               echo "Contents of $TEST_RESULTS_FILE that may have caused an error:"
-              head -c 1000 "$TEST_RESULTS_FILE" # Print first 1000 chars
-              echo "" # Newline after head
+              head -c 1000 "$TEST_RESULTS_FILE"
+              echo ""
             elif [ -f "$TEST_RESULTS_FILE" ]; then
               echo "$TEST_RESULTS_FILE exists but is empty."
             fi
             exit 1
           fi
 
-          echo "Enriched payload to send (first 500 chars):"
-          echo "$enriched_payload" | head -c 500
-          echo ""
-
-          echo "Sending data to webhook: $WEBHOOK_URL"
-          http_response_code=$(curl -s -w "%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Event: $GH_EVENT_NAME" \
-            -H "X-GitHub-Run-Id: $GH_RUN_ID" \
-            --data "$enriched_payload" \
-            "$WEBHOOK_URL" \
-            -o curl_response_body.txt 2>curl_stderr.txt)
-
-          curl_stderr_content=$(cat curl_stderr.txt)
-          if [ -n "$curl_stderr_content" ]; then
-            echo "::warning::curl stderr: $curl_stderr_content"
+          # Validate the produced JSON
+          if ! printf '%s' "$enriched_payload" | jq empty 2>/dev/null; then
+            echo "::error::Invalid JSON produced by jq transformation"
+            exit 1
           fi
-          echo "Webhook response code: $http_response_code"
-          echo "Webhook response body:"
-          cat curl_response_body.txt
-          if [[ "$http_response_code" -ge 200 && "$http_response_code" -lt 300 ]]; then
-            echo "Successfully sent data to webhook."
+
+          # Display payload info safely
+          payload_size=${#enriched_payload}
+          echo "Payload size: $payload_size bytes"
+
+          if [ $payload_size -gt 0 ]; then
+            echo "Enriched payload to send (first 500 chars):"
+            printf '%s\n' "$enriched_payload" | head -c 500
+            echo ""  # Newline after truncated output
           else
-            echo "::error::Webhook call failed with status code $http_response_code."
+            echo "::warning::Enriched payload is empty!"
+            exit 1
           fi
