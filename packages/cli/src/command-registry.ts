@@ -22,7 +22,7 @@ export class CommandRegistry {
 		private readonly moduleRegistry: ModuleRegistry,
 		private readonly logger: Logger,
 	) {
-		this.argv = argvParser(process.argv.slice(2));
+		this.argv = argvParser(process.argv.slice(2), { string: ['id'] });
 		this.commandName = process.argv[2] ?? 'start';
 	}
 
