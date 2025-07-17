@@ -1,61 +1,62 @@
 {
-	"data": {
-		"startData": {},
-		"resultData": {
-			"runData": {
-				"Start": [
-					{
-						"startTime": 1747343994481,
-						"executionIndex": 0,
-						"source": [],
-						"hints": [],
-						"executionTime": 0,
-						"executionStatus": "success",
-						"data": {
-							"main": [
-								[
-									{
-										"json": {},
-										"pairedItem": {
-											"item": 0
-										}
-									}
-								]
-							]
-						}
-					}
-				],
-				"Read Binary Files": [
-					{
-						"startTime": 1747343994481,
-						"executionIndex": 1,
-						"source": [
-							{
-								"previousNode": "Start"
-							}
-						],
-						"hints": [],
-						"executionTime": 54,
-						"executionStatus": "success",
-						"data": {
-							"main": [[]]
-						}
-					}
-				]
-			},
-			"lastNodeExecuted": "Read Binary Files"
-		},
-		"executionData": {
-			"contextData": {},
-			"nodeExecutionStack": [],
-			"metadata": {},
-			"waitingExecution": {},
-			"waitingExecutionSource": {}
-		}
+	"_meta": {
+		"shallow": true,
+		"createdAt": "2025-07-17T15:46:14.919Z",
+		"workflowId": "107"
 	},
-	"mode": "cli",
-	"startedAt": "2025-05-15T21:19:54.481Z",
-	"stoppedAt": "2025-05-15T21:19:54.535Z",
-	"status": "running",
-	"finished": true
+	"result": {
+		"data": {
+			"startData": {},
+			"resultData": {
+				"runData": {
+					"Start": [
+						{
+							"executionIndex": 0,
+							"source": [],
+							"hints": [],
+							"executionStatus": "success",
+							"data": {
+								"main": [
+									[
+										{
+											"json": {},
+											"pairedItem": {
+												"item": 0
+											}
+										}
+									]
+								]
+							}
+						}
+					],
+					"Read Binary Files": [
+						{
+							"executionIndex": 1,
+							"source": [
+								{
+									"previousNode": "Start"
+								}
+							],
+							"hints": [],
+							"executionStatus": "success",
+							"data": {
+								"main": [[]]
+							}
+						}
+					]
+				},
+				"lastNodeExecuted": "Read Binary Files"
+			},
+			"executionData": {
+				"contextData": {},
+				"nodeExecutionStack": [],
+				"metadata": {},
+				"waitingExecution": {},
+				"waitingExecutionSource": {}
+			}
+		},
+		"mode": "cli",
+		"status": "running",
+		"finished": true
+	}
 }

@@ -10,7 +10,6 @@ const N8N_CLI_PATH_ENV_VAR = process.env.N8N_CLI_PATH;
 const N8N_CLI_POSSIBLE_PATHS = ['../../../cli/bin/n8n', '../../cli/bin/n8n'];
 const CREDENTIALS_FILE_NAME = 'credentials.json';
 const WORKFLOWS_DIR_NAME = 'workflows';
-const ASSETS_SOURCE_PATH = path.join(__dirname, '../../../assets');
 const PDF_SOURCE_DIR = path.join(__dirname, 'testData', 'pdfs');
 
 const BASE_TMP_DIR = '/tmp';
@@ -126,7 +125,7 @@ async function copyAsset(sourcePath: string, destinationPath: string): Promise<v
  * and copying necessary test data/assets.
  * This function is designed to be used as a global setup hook in testing frameworks.
  */
-export async function globalSetup(): Promise<void> {
+export async function globalWorkflowSetup(): Promise<void> {
 	console.log('\n--- 🚀 Starting n8n workflow test environment setup ---\n');
 
 	try {
@@ -146,15 +145,6 @@ export async function globalSetup(): Promise<void> {
 		console.log('📁 Copying test assets...');
 
 		await fsPromises.mkdir(BASE_TMP_DIR, { recursive: true });
-
-		await copyAsset(
-			path.join(ASSETS_SOURCE_PATH, 'n8n-logo.png'),
-			path.join(BASE_TMP_DIR, 'n8n-logo.png'),
-		);
-		await copyAsset(
-			path.join(ASSETS_SOURCE_PATH, 'n8n-screenshot.png'),
-			path.join(BASE_TMP_DIR, 'n8n-screenshot.png'),
-		);
 
 		await copyAsset(PDF_SOURCE_DIR, TMP_PDF_DEST_DIR);
 

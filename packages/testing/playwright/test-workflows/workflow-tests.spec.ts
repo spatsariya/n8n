@@ -1,10 +1,65 @@
 /* eslint-disable playwright/no-conditional-in-test */
-import { test } from '@playwright/test';
+import { test, expect, type TestInfo } from '@playwright/test';
 import type { ExecSyncOptionsWithStringEncoding } from 'child_process';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
-import { diff } from 'json-diff';
 import path from 'path';
+
+import { globalWorkflowSetup } from './global-setup-workflows';
+
+const SETUP_LOCK_FILE = path.join(__dirname, '.workflow-setup-complete');
+
+// Ensure setup runs only once across all workers
+test.beforeAll(async () => {
+	// Check if setup has already been done
+	if (fs.existsSync(SETUP_LOCK_FILE)) {
+		const setupTime = fs.statSync(SETUP_LOCK_FILE).mtime;
+		const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+		// If setup was done within the last hour, skip
+		if (setupTime > hourAgo) {
+			console.log('✅ Workflow setup already complete (cached)');
+			return;
+		}
+	}
+
+	// Acquire lock and run setup
+	const lockFile = `${SETUP_LOCK_FILE}.lock`;
+	const maxWaitTime = 60000; // 60 seconds
+	const startTime = Date.now();
+
+	// Wait for any other worker that might be setting up
+	while (fs.existsSync(lockFile)) {
+		if (Date.now() - startTime > maxWaitTime) {
+			throw new Error('Timeout waiting for workflow setup lock');
+		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+
+	// If setup is now complete, we're done
+	if (fs.existsSync(SETUP_LOCK_FILE)) {
+		console.log('✅ Workflow setup completed by another worker');
+		return;
+	}
+
+	try {
+		// Create lock file
+		fs.writeFileSync(lockFile, process.pid.toString());
+
+		// Run setup
+		console.log('🚀 Running workflow setup...');
+		await globalWorkflowSetup();
+
+		// Mark setup as complete
+		fs.writeFileSync(SETUP_LOCK_FILE, new Date().toISOString());
+		console.log('✅ Workflow setup complete');
+	} finally {
+		// Remove lock file
+		if (fs.existsSync(lockFile)) {
+			fs.unlinkSync(lockFile);
+		}
+	}
+});
 
 const WORKFLOWS_SOURCE_DIR = path.join(__dirname, 'workflows');
 const WORKFLOW_SNAPSHOTS_DIR = path.join(__dirname, 'snapshots');
@@ -28,13 +83,24 @@ const WARNING_PATTERNS = new Set([
 	'504',
 ]);
 
-// --- Type Definitions (for better type safety and readability) ---
+const GLOBALLY_IGNORED_PROPERTIES = [
+	'executionTime',
+	'startTime',
+	'startedAt',
+	'stoppedAt',
+	'containerId',
+	'isAgentRunning',
+	'nbLaunches',
+	'lastEndedAt',
+];
+
+// --- Type Definitions ---
 
 interface Workflow {
 	id: string;
 	name: string;
 	nodes?: WorkflowNode[];
-	[key: string]: any; // Allow other properties
+	[key: string]: any;
 }
 
 interface WorkflowNode {
@@ -50,7 +116,8 @@ interface RunDataItem {
 
 interface RunDataOutput {
 	data?: {
-		main?: RunDataItem[][]; // Array of arrays, where inner array is items for that node run
+		main?: RunDataItem[][];
+		[key: string]: RunDataItem[][];
 	};
 	[key: string]: any;
 }
@@ -58,7 +125,7 @@ interface RunDataOutput {
 interface WorkflowExecutionResult {
 	data?: {
 		resultData?: {
-			runData?: Record<string, RunDataOutput[]>; // NodeName -> Array of run outputs
+			runData?: Record<string, RunDataOutput[]>;
 			error?: {
 				message?: string;
 				description?: string;
@@ -75,11 +142,114 @@ interface NodeRules {
 	keepOnlyProperties?: string[];
 }
 
+interface TestMode {
+	shouldCompareSnapshots: boolean;
+	shouldUpdateSnapshots: boolean;
+	isShallow: boolean;
+}
+
 // --- Helper Functions ---
 
 /**
+ * Gets the test mode configuration from environment variables
+ */
+function getTestMode(): TestMode {
+	const snapshotsMode = process.env.SNAPSHOTS?.toLowerCase();
+	// Default to shallow mode unless explicitly set to deep
+	const isShallow = process.env.SNAPSHOT_MODE?.toLowerCase() !== 'deep';
+
+	return {
+		shouldCompareSnapshots: snapshotsMode === 'compare',
+		shouldUpdateSnapshots: snapshotsMode === 'update',
+		isShallow,
+	};
+}
+
+/**
+ * Recursively traverses an object or array and removes any properties that
+ * match the keys in the provided list.
+ */
+function removePropertiesRecursively(obj: any, propertiesToRemove: string[]): void {
+	if (obj === null || typeof obj !== 'object') {
+		return;
+	}
+
+	if (Array.isArray(obj)) {
+		obj.forEach((item) => removePropertiesRecursively(item, propertiesToRemove));
+		return;
+	}
+
+	for (const key in obj) {
+		if (Object.prototype.hasOwnProperty.call(obj, key)) {
+			if (propertiesToRemove.includes(key)) {
+				delete obj[key];
+			} else {
+				removePropertiesRecursively(obj[key], propertiesToRemove);
+			}
+		}
+	}
+}
+
+/**
+ * Removes globally ignored dynamic properties from the result object to ensure
+ * deterministic snapshot comparisons.
+ */
+function sanitizeResult(result: WorkflowExecutionResult): void {
+	removePropertiesRecursively(result, GLOBALLY_IGNORED_PROPERTIES);
+}
+
+/**
+ * Performs a deep, recursive comparison of two objects and returns a list of
+ * dot-notation paths to any properties that differ.
+ *
+ * Note: This function always performs a deep comparison. "Shallow" testing is
+ * achieved by simplifying the `actual` data with `processShallow` *before*
+ * calling this function.
+ */
+function findDifferences(expected: any, actual: any, path = ''): string[] {
+	const differences: string[] = [];
+
+	if (expected === actual) return differences;
+
+	if (
+		typeof expected !== 'object' ||
+		expected === null ||
+		typeof actual !== 'object' ||
+		actual === null ||
+		Array.isArray(expected) !== Array.isArray(actual)
+	) {
+		if (path) differences.push(path);
+		return differences;
+	}
+
+	if (Array.isArray(expected)) {
+		if (expected.length !== actual.length && path) {
+			differences.push(path);
+		}
+		const len = Math.min(expected.length, actual.length);
+		for (let i = 0; i < len; i++) {
+			differences.push(...findDifferences(expected[i], actual[i], `${path}[${i}]`));
+		}
+	} else {
+		const expectedKeys = new Set(Object.keys(expected));
+		const actualKeys = new Set(Object.keys(actual));
+		const allKeys = new Set([...expectedKeys, ...actualKeys]);
+
+		for (const key of allKeys) {
+			const newPath = path ? `${path}.${key}` : key;
+			if (!actualKeys.has(key) || !expectedKeys.has(key)) {
+				differences.push(newPath);
+			} else {
+				differences.push(...findDifferences(expected[key], actual[key], newPath));
+			}
+		}
+	}
+
+	return [...new Set(differences)]; // Return unique paths
+}
+
+/**
  * Loads workflows from the specified directory and a skip list from a JSON file.
- * @returns An object containing an array of parsed workflow objects and an array of skipped workflow IDs.
  */
 function loadWorkflowsAndSkipList(): { workflows: Workflow[]; skipList: Set<string> } {
 	const workflows: Workflow[] = fs
@@ -96,23 +266,17 @@ function loadWorkflowsAndSkipList(): { workflows: Workflow[]; skipList: Set<stri
 					String(s.workflowId),
 				),
 			)
-		: new Set(); // Use a Set for skipList for O(1) lookups
+		: new Set();
 
 	return { workflows, skipList };
 }
 
 /**
  * Executes an n8n workflow via the CLI and processes its raw JSON output.
- * Handles CLI execution errors and extracts n8n specific error details.
- *
- * @param workflowId The ID of the workflow to execute.
- * @param testInfo Playwright's TestInfo object for annotations.
- * @returns The parsed JSON output from the workflow, or `undefined` if a warning occurred.
- * @throws {Error} If the workflow execution fails critically.
  */
 function runWorkflowAndHandleOutput(
 	workflowId: string,
-	testInfo: any,
+	testInfo: TestInfo,
 ): WorkflowExecutionResult | undefined {
 	const command = `${N8N_CLI_TEST_PATH} execute --id="${workflowId}" --rawOutput`;
 
@@ -128,23 +292,19 @@ function runWorkflowAndHandleOutput(
 			...process.env,
 			...(process.env.N8N_ENCRYPTION_KEY && { N8N_ENCRYPTION_KEY: process.env.N8N_ENCRYPTION_KEY }),
 			N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: 'true',
+			SKIP_STATISTICS_EVENTS: 'true',
 		},
 	};
 
 	try {
 		const output = execSync(command, options).toString();
-
 		const jsonStartIndex = output.indexOf('{');
 		if (jsonStartIndex === -1) {
-			// If no '{' is found, it's either truly empty or not JSON.
-			// For --rawOutput, we generally expect JSON, even for empty results.
 			if (output.trim().length > 0) {
 				throw new Error(`CLI output is not JSON and not empty: ${output}`);
 			}
-			// If output is empty/whitespace, return a default empty structure for consistency.
 			return { data: { resultData: { runData: {}, error: null } } };
 		}
-
 		const potentialJson = output.substring(jsonStartIndex);
 		try {
 			return JSON.parse(potentialJson) as WorkflowExecutionResult;
@@ -154,33 +314,30 @@ function runWorkflowAndHandleOutput(
 			);
 		}
 	} catch (error: any) {
-		// This block catches errors from execSync (non-zero exit code).
 		const fullStdout = error.stdout?.toString() ?? '';
 		const fullStderr = error.stderr?.toString() ?? '';
-
 		let workflowError: any = null;
 		let actualErrorMessage = 'Unknown error during CLI execution.';
 
-		// Prioritize extracting structured error from stdout if present (n8n CLI often puts errors here)
 		const jsonStartIndexInErrorStdout = fullStdout.indexOf('{');
 		if (jsonStartIndexInErrorStdout !== -1) {
 			try {
 				const potentialJson = fullStdout.substring(jsonStartIndexInErrorStdout);
-				const parsedErrorOutput = JSON.parse(potentialJson);
-				workflowError = parsedErrorOutput?.data?.resultData?.error;
-			} catch (parseError) {
-				// Not a JSON error, fall through to text parsing
+				workflowError = JSON.parse(potentialJson)?.data?.resultData?.error;
+			} catch (e) {
+				// Not a JSON error, fall through
 			}
 		}
 
 		if (workflowError) {
 			actualErrorMessage = workflowError.message ?? workflowError.description ?? actualErrorMessage;
 		} else {
-			// If no structured error, use stderr or the primary error message
-			actualErrorMessage = fullStderr ?? error.message ?? actualErrorMessage;
+			actualErrorMessage = fullStderr || error.message || actualErrorMessage;
 		}
 
-		const isWarning = WARNING_PATTERNS.has(actualErrorMessage.toLowerCase());
+		const isWarning = [...WARNING_PATTERNS].some((pattern) =>
+			actualErrorMessage.toLowerCase().includes(pattern),
+		);
 
 		if (isWarning) {
 			testInfo.annotations.push({
@@ -188,179 +345,143 @@ function runWorkflowAndHandleOutput(
 				description: `Execution warning: ${actualErrorMessage}`,
 			});
 			console.warn(`⚠️  Warning in workflow ${workflowId}: ${actualErrorMessage}`);
-			return undefined; // Indicate a warning, not a failure
+			return undefined;
 		}
 
-		// It's a critical error. Log detailed info and re-throw.
+		// Log detailed info for critical errors and re-throw
 		console.error(`❌ Workflow execution failed for ID ${workflowId}:`);
-		console.error('--- CLI Stdout (from failed command) ---');
-		console.error(fullStdout ?? '[No stdout]');
-		console.error('--- CLI Stderr (from failed command) ---');
-		console.error(fullStderr ?? '[No stderr]');
+		console.error('--- CLI Stdout ---\n', fullStdout || '[No stdout]');
+		console.error('--- CLI Stderr ---\n', fullStderr || '[No stderr]');
 		if (workflowError) {
-			console.error('--- Parsed Workflow Error Details ---');
-			console.error(JSON.stringify(workflowError, null, 2));
+			console.error('--- Parsed Workflow Error ---\n', JSON.stringify(workflowError, null, 2));
 		}
-
 		throw new Error(`Workflow execution failed: ${actualErrorMessage}`);
 	}
 }
 
 /**
- * Compares the workflow execution result with a stored snapshot.
- * Reports differences and throws an error for breaking changes.
- *
- * @param result The actual workflow execution result.
- * @param workflowId The ID of the executed workflow.
- * @param testInfo Playwright's TestInfo object for annotations.
+ * Handles snapshot creation or comparison, adding annotations to the test report.
  */
-function compareWithSnapshot(result: WorkflowExecutionResult, workflowId: string, testInfo: any) {
-	// Allow disabling snapshot comparison via environment variable
-	if (process.env.WORKFLOW_TEST_COMPARE_SNAPSHOTS === 'false') {
-		console.log(
-			`ℹ️ Skipping snapshot comparison for ${workflowId} (WORKFLOW_TEST_COMPARE_SNAPSHOTS=false)`,
-		);
+function verifySnapshot(actual: object, workflowId: string, testInfo: TestInfo) {
+	const { shouldCompareSnapshots, shouldUpdateSnapshots, isShallow } = getTestMode();
+
+	// If snapshots are not enabled at all, skip
+	if (!shouldCompareSnapshots && !shouldUpdateSnapshots) {
+		console.log(`ℹ️  Skipping snapshot handling for ${workflowId} (snapshots not enabled)`);
+		testInfo.annotations.push({ type: 'snapshot', description: 'Snapshots not enabled' });
 		return;
 	}
 
 	const snapshotPath = path.join(WORKFLOW_SNAPSHOTS_DIR, `${workflowId}-snapshot.json`);
 
-	if (!fs.existsSync(snapshotPath)) {
+	if (shouldUpdateSnapshots) {
+		const isUpdate = fs.existsSync(snapshotPath);
+		console.log(`💾 ${isUpdate ? 'Updating' : 'Creating'} snapshot for workflow ${workflowId}...`);
+
+		if (!fs.existsSync(WORKFLOW_SNAPSHOTS_DIR)) {
+			fs.mkdirSync(WORKFLOW_SNAPSHOTS_DIR, { recursive: true });
+		}
+
+		// Store snapshot with metadata
+		const snapshotData = {
+			_meta: {
+				shallow: isShallow,
+				createdAt: new Date().toISOString(),
+				workflowId: workflowId,
+			},
+			result: actual,
+		};
+
+		fs.writeFileSync(snapshotPath, JSON.stringify(snapshotData, null, 2), 'utf-8');
+
 		testInfo.annotations.push({
-			type: 'no-snapshot',
-			description:
-				'No snapshot file found for comparison. Consider running with WORKFLOW_TEST_SAVE_SNAPSHOTS=true',
+			type: 'snapshot',
+			description: `${isUpdate ? 'Updated' : 'Created'} (${isShallow ? 'shallow' : 'deep'} mode)`,
 		});
-		console.warn(`⚠️  No snapshot found for workflow ${workflowId}. Skipping comparison.`);
+		console.log(`   Snapshot saved to: ${snapshotPath} in ${isShallow ? 'shallow' : 'deep'} mode`);
 		return;
 	}
 
-	const expected = JSON.parse(fs.readFileSync(snapshotPath, 'utf-8')) as WorkflowExecutionResult;
-	// Use `diff.changes(a, b)` for a more concise diff object when just checking existence
-	const changes = diff(expected, result, { keysOnly: true });
+	// shouldCompareSnapshots is true here
+	if (!fs.existsSync(snapshotPath)) {
+		throw new Error(
+			`📸 Snapshot not found for workflow ${workflowId}. Run with SNAPSHOTS=update to create it.`,
+		);
+	}
 
-	if (changes) {
-		const changesStr = JSON.stringify(changes, null, 2);
-		const hasDeleted = changesStr.includes('__deleted');
+	const snapshotContent = JSON.parse(fs.readFileSync(snapshotPath, 'utf-8'));
 
-		testInfo.annotations.push({ type: 'snapshot-diff', description: changesStr });
+	// Handle both old format (direct result) and new format (with metadata)
+	let expected: any;
+	let snapshotIsShallow: boolean | undefined;
 
-		if (hasDeleted) {
-			throw new Error(
-				`Breaking changes (deleted fields) detected in workflow ${workflowId} snapshot:\n${changesStr}`,
-			);
-		} else {
-			console.warn(
-				`⚠️  Non-breaking changes (new/modified fields) detected in workflow ${workflowId} snapshot:\n${changesStr}`,
-			);
+	if (snapshotContent._meta) {
+		// New format with metadata
+		expected = snapshotContent.result;
+		snapshotIsShallow = snapshotContent._meta.shallow;
+
+		// Check for mode mismatch
+		if (snapshotIsShallow !== undefined && snapshotIsShallow !== isShallow) {
+			const warningMessage = `⚠️  Mode mismatch for workflow ${workflowId}: Snapshot was created in ${snapshotIsShallow ? 'shallow' : 'deep'} mode, but test is running in ${isShallow ? 'shallow' : 'deep'} mode. Consider updating the snapshot with SNAPSHOTS=update`;
+
+			console.warn(warningMessage);
+			testInfo.annotations.push({
+				type: 'warning',
+				description: warningMessage,
+			});
 		}
 	} else {
-		console.log(`✅ Snapshot for workflow ${workflowId} matches.`);
-	}
-}
-
-/**
- * Saves the workflow result as a snapshot file.
- * This operation is typically controlled by an environment variable.
- *
- * @param result The workflow execution result to save.
- * @param workflowId The ID of the workflow.
- * @param testInfo Playwright's TestInfo object for annotations.
- */
-function saveSnapshot(result: WorkflowExecutionResult, workflowId: string, testInfo: any) {
-	// Allow disabling snapshot saving via environment variable
-	if (process.env.WORKFLOW_TEST_SAVE_SNAPSHOTS !== 'true') {
+		// Old format - direct result
+		expected = snapshotContent;
 		console.log(
-			`ℹ️ Skipping snapshot saving for ${workflowId} (WORKFLOW_TEST_SAVE_SNAPSHOTS is not 'true')`,
+			`ℹ️  Legacy snapshot format detected for workflow ${workflowId}. Consider updating with SNAPSHOTS=update`,
 		);
-		return;
 	}
 
-	if (!fs.existsSync(WORKFLOW_SNAPSHOTS_DIR)) {
-		fs.mkdirSync(WORKFLOW_SNAPSHOTS_DIR, { recursive: true });
+	const differences = findDifferences(expected, actual);
+	if (differences.length > 0) {
+		testInfo.annotations.push({
+			type: 'diff',
+			description: `Snapshot differences found in fields:\n- ${differences.join('\n- ')}`,
+		});
 	}
 
-	const snapshotPath = path.join(WORKFLOW_SNAPSHOTS_DIR, `${workflowId}-snapshot.json`);
-	fs.writeFileSync(snapshotPath, JSON.stringify(result, null, 2), 'utf-8');
-
-	testInfo.annotations.push({
-		type: 'snapshot-saved',
-		description: `Snapshot saved for workflow ${workflowId} at ${snapshotPath}`,
-	});
-	console.log(`💾 Snapshot saved for workflow ${workflowId}.`);
+	expect(actual).toEqual(expected);
 }
 
 /**
- * Applies shallow processing to the workflow result, replacing complex structures
- * with simple placeholders for consistent snapshots.
- * @param data The workflow execution result object.
+ * Simplifies nested objects and arrays in a workflow result to placeholders.
+ * This is used when `SNAPSHOT_MODE` is not 'deep' (shallow is default).
+ *
+ * In shallow mode, this function:
+ * 1. Applies node special cases (capResults, ignoredProperties, keepOnlyProperties)
+ * 2. Converts remaining arrays to ['json array'] and objects to { object: true }
+ *
+ * This ensures that top-level attributes are kept with their correct types,
+ * while reducing false positives from complex nested data.
  */
-function processShallow(data: WorkflowExecutionResult): void {
+function processShallow(data: WorkflowExecutionResult, workflow: Workflow): void {
 	const runData = data.data?.resultData?.runData;
 	if (!runData) return;
 
-	for (const nodeName in runData) {
-		// Ensure we only iterate over own properties
-		if (!Object.prototype.hasOwnProperty.call(runData, nodeName)) continue;
-
-		const nodeRuns = runData[nodeName];
-		if (!Array.isArray(nodeRuns)) continue;
-
-		for (const run of nodeRuns) {
-			const outputs = run.data?.main;
-			if (!Array.isArray(outputs)) continue;
-
-			for (const outputArray of outputs) {
-				if (!Array.isArray(outputArray)) continue;
-
-				for (const item of outputArray) {
-					if (!item?.json || typeof item.json !== 'object') continue;
-
-					for (const key in item.json) {
-						if (!Object.prototype.hasOwnProperty.call(item.json, key)) continue;
-
-						const value = item.json[key];
-						if (Array.isArray(value)) {
-							item.json[key] = ['json array']; // Replace array with a placeholder
-						} else if (value && typeof value === 'object') {
-							item.json[key] = { object: true }; // Replace object with a placeholder
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-/**
- * Applies special case rules defined in workflow node notes to modify the result data.
- * Rules include capping results, ignoring properties, or keeping only specific properties.
- *
- * @param data The workflow execution result object.
- * @param workflow The workflow definition object containing node notes.
- */
-function applyNodeSpecialCases(data: WorkflowExecutionResult, workflow: Workflow): void {
+	// Extract node special cases
 	const specialCases: Record<string, NodeRules> = {};
-
-	// 1. Extract special cases from node notes
 	workflow.nodes?.forEach((node) => {
 		if (!node.notes) return;
-
 		const rules: NodeRules = {};
 		node.notes.split('\n').forEach((line) => {
 			const [key, value] = line.split('=').map((s) => s?.trim());
 			if (!key || !value) return;
-
 			switch (key) {
 				case 'CAP_RESULTS_LENGTH':
 					rules.capResults = parseInt(value, 10);
-					if (isNaN(rules.capResults)) delete rules.capResults; // Ensure it's a valid number
+					if (isNaN(rules.capResults)) delete rules.capResults;
 					break;
 				case 'IGNORED_PROPERTIES':
 					rules.ignoredProperties = value
 						.split(',')
 						.map((s) => s.trim())
-						.filter(Boolean); // Filter out empty strings
+						.filter(Boolean);
 					break;
 				case 'KEEP_ONLY_PROPERTIES':
 					rules.keepOnlyProperties = value
@@ -370,60 +491,145 @@ function applyNodeSpecialCases(data: WorkflowExecutionResult, workflow: Workflow
 					break;
 			}
 		});
-
-		if (Object.keys(rules).length > 0) {
-			specialCases[node.name] = rules;
-		}
+		if (Object.keys(rules).length > 0) specialCases[node.name] = rules;
 	});
-
-	// 2. Apply the rules to the run data
-	const runData = data.data?.resultData?.runData;
-	if (!runData || Object.keys(specialCases).length === 0) return;
 
 	for (const nodeName in runData) {
 		if (!Object.prototype.hasOwnProperty.call(runData, nodeName)) continue;
 
-		const rules = specialCases[nodeName];
-		if (!rules) continue;
+		const nodeRules = specialCases[nodeName] || {};
 
-		const nodeRuns = runData[nodeName];
-		if (!Array.isArray(nodeRuns)) continue;
+		runData[nodeName].forEach((run) => {
+			if (!run.data) return;
 
-		for (const run of nodeRuns) {
-			const outputs = run.data?.main;
-			if (!Array.isArray(outputs)) continue;
+			// Process all properties under data, not just 'main'
+			for (const outputType in run.data) {
+				if (!Object.prototype.hasOwnProperty.call(run.data, outputType)) continue;
+				const outputs = run.data[outputType];
 
-			for (const outputArray of outputs) {
-				if (!Array.isArray(outputArray)) continue;
+				if (!Array.isArray(outputs)) continue;
 
-				// Apply result cap (before property manipulation to avoid issues)
-				if (rules.capResults !== undefined && outputArray.length > rules.capResults) {
-					outputArray.splice(rules.capResults);
-				}
+				outputs.forEach((outputArray) => {
+					if (!Array.isArray(outputArray)) return;
 
-				for (const item of outputArray) {
-					if (!item?.json || typeof item.json !== 'object') continue;
-
-					// Remove ignored properties
-					if (rules.ignoredProperties?.length) {
-						for (const prop of rules.ignoredProperties) {
-							delete item.json[prop];
-						}
+					// Apply capResults first
+					if (nodeRules.capResults !== undefined && outputArray.length > nodeRules.capResults) {
+						outputArray.splice(nodeRules.capResults);
 					}
 
-					// Keep only specified properties (applied after ignored to ensure precedence)
-					if (rules.keepOnlyProperties?.length) {
-						const newJson: Record<string, any> = {};
-						for (const prop of rules.keepOnlyProperties) {
-							if (Object.prototype.hasOwnProperty.call(item.json, prop)) {
-								newJson[prop] = item.json[prop];
-							}
+					outputArray.forEach((item) => {
+						if (!item?.json || typeof item.json !== 'object') return;
+
+						// Apply ignoredProperties
+						if (nodeRules.ignoredProperties) {
+							nodeRules.ignoredProperties.forEach((prop) => delete item.json?.[prop]);
 						}
-						item.json = newJson;
-					}
-				}
+
+						// Apply keepOnlyProperties
+						if (nodeRules.keepOnlyProperties) {
+							const newJson: Record<string, any> = {};
+							nodeRules.keepOnlyProperties.forEach((prop) => {
+								if (Object.prototype.hasOwnProperty.call(item.json, prop))
+									newJson[prop] = item.json?.[prop];
+							});
+							item.json = newJson;
+						}
+
+						// Now apply shallow processing to remaining properties
+						for (const key in item.json) {
+							if (!Object.prototype.hasOwnProperty.call(item.json, key)) continue;
+							const value = item.json[key];
+							if (Array.isArray(value)) item.json[key] = ['json array'];
+							else if (value && typeof value === 'object') item.json[key] = { object: true };
+						}
+					});
+				});
 			}
-		}
+		});
+	}
+}
+
+/**
+ * Applies special case rules defined in a workflow node's "Notes" field.
+ * This allows for per-node modifications of the output data to handle
+ * dynamic values like timestamps or random IDs.
+ *
+ * @example
+ * // In the n8n UI, a node's Notes field might contain:
+ * IGNORED_PROPERTIES=id,createdAt,updatedAt
+ * CAP_RESULTS_LENGTH=1
+ */
+function applyNodeSpecialCases(data: WorkflowExecutionResult, workflow: Workflow): void {
+	const specialCases: Record<string, NodeRules> = {};
+
+	workflow.nodes?.forEach((node) => {
+		if (!node.notes) return;
+		const rules: NodeRules = {};
+		node.notes.split('\n').forEach((line) => {
+			const [key, value] = line.split('=').map((s) => s?.trim());
+			if (!key || !value) return;
+			switch (key) {
+				case 'CAP_RESULTS_LENGTH':
+					rules.capResults = parseInt(value, 10);
+					if (isNaN(rules.capResults)) delete rules.capResults;
+					break;
+				case 'IGNORED_PROPERTIES':
+					rules.ignoredProperties = value
+						.split(',')
+						.map((s) => s.trim())
+						.filter(Boolean);
+					break;
+				case 'KEEP_ONLY_PROPERTIES':
+					rules.keepOnlyProperties = value
+						.split(',')
+						.map((s) => s.trim())
+						.filter(Boolean);
+					break;
+			}
+		});
+		if (Object.keys(rules).length > 0) specialCases[node.name] = rules;
+	});
+
+	const runData = data.data?.resultData?.runData;
+	if (!runData || Object.keys(specialCases).length === 0) return;
+
+	for (const nodeName in runData) {
+		if (!Object.prototype.hasOwnProperty.call(runData, nodeName) || !specialCases[nodeName])
+			continue;
+		const rules = specialCases[nodeName];
+		runData[nodeName].forEach((run) => {
+			// Handle all output types, not just main
+			if (!run.data) return;
+
+			for (const outputType in run.data) {
+				if (!Object.prototype.hasOwnProperty.call(run.data, outputType)) continue;
+				const outputs = run.data[outputType];
+
+				if (!Array.isArray(outputs)) continue;
+
+				outputs.forEach((outputArray) => {
+					if (!Array.isArray(outputArray)) return;
+
+					if (rules.capResults !== undefined && outputArray.length > rules.capResults) {
+						outputArray.splice(rules.capResults);
+					}
+					outputArray.forEach((item) => {
+						if (!item?.json || typeof item.json !== 'object') return;
+						if (rules.ignoredProperties) {
+							rules.ignoredProperties.forEach((prop) => delete item.json?.[prop]);
+						}
+						if (rules.keepOnlyProperties) {
+							const newJson: Record<string, any> = {};
+							rules.keepOnlyProperties.forEach((prop) => {
+								if (Object.prototype.hasOwnProperty.call(item.json, prop))
+									newJson[prop] = item.json?.[prop];
+							});
+							item.json = newJson;
+						}
+					});
+				});
+			}
+		});
 	}
 }
 
@@ -432,44 +638,43 @@ function applyNodeSpecialCases(data: WorkflowExecutionResult, workflow: Workflow
 test.describe('Workflow Execution Tests', () => {
 	const { workflows, skipList } = loadWorkflowsAndSkipList();
 
-	// Dynamically create a test for each workflow found
 	workflows.forEach((workflow) => {
-		// Convert workflow ID to string early for consistent comparison
 		const workflowId = String(workflow.id);
 
 		test(`Execute: ${workflow.name} (ID: ${workflowId})`, ({}, testInfo) => {
-			// Use test.skip for conditional skipping
-			// eslint-disable-next-line playwright/no-skipped-test
 			test.skip(skipList.has(workflowId), 'Workflow is in skip list');
 
-			console.log(`\n--- Running workflow: ${workflow.name} (ID: ${workflowId}) ---\n`);
+			console.log(`\n--- Running workflow: ${workflow.name} (ID: ${workflowId}) ---`);
 
-			// Execute the workflow and get the result
 			const result = runWorkflowAndHandleOutput(workflowId, testInfo);
 
-			// If `runWorkflowAndHandleOutput` returns undefined, it means a warning was
-			// logged, and the test should not proceed to snapshot comparison/saving.
 			if (!result) {
-				console.log(
-					`ℹ️ Workflow ${workflowId} completed with warnings. Skipping snapshot operations.`,
-				);
+				console.log(`ℹ️  Workflow ${workflowId} completed with warnings. Skipping snapshot.`);
 				return;
 			}
 
-			// Apply data transformation rules before snapshot operations
-			applyNodeSpecialCases(result, workflow);
+			sanitizeResult(result);
 
-			// Apply shallow processing if enabled via environment variable
-			if (process.env.WORKFLOW_TEST_SHALLOW === 'true') {
-				console.log(`ℹ️ Applying shallow processing for workflow ${workflowId}.`);
-				processShallow(result);
+			const { isShallow } = getTestMode();
+			if (isShallow) {
+				console.log(`ℹ️  Applying shallow processing for workflow ${workflowId}.`);
+				processShallow(result, workflow);
+				testInfo.annotations.push({ type: 'processing', description: 'Shallow mode' });
+			} else {
+				// Only apply node special cases in deep mode
+				// In shallow mode, they're applied within processShallow
+				applyNodeSpecialCases(result, workflow);
 			}
 
-			// Compare and save snapshots
-			compareWithSnapshot(result, workflowId, testInfo);
-			saveSnapshot(result, workflowId, testInfo);
+			verifySnapshot(result, workflowId, testInfo);
 
-			console.log(`\n--- Workflow ${workflowId} test completed. ---\n`);
+			// Update success message based on mode
+			const { shouldCompareSnapshots, shouldUpdateSnapshots } = getTestMode();
+			if (shouldCompareSnapshots) {
+				console.log(`✅ Snapshot for workflow ${workflowId} matches.`);
+			} else if (!shouldUpdateSnapshots) {
+				console.log(`✅ Workflow ${workflowId} executed successfully.`);
+			}
 		});
 	});
 });
