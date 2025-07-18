@@ -135,6 +135,10 @@ const plugins: UserConfig['plugins'] = [
 			return html.replace('%CONFIG_SCRIPT%', replacement);
 		},
 	},
+	// For sanitize-html
+	nodePolyfills({
+		include: ['fs', 'path', 'url', 'util', 'timers'],
+	}),
 ];
 
 const { RELEASE: release } = process.env;
