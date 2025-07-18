@@ -1,53 +1,61 @@
-/* eslint-disable playwright/expect-expect */
 /* eslint-disable playwright/no-conditional-expect */
 /* eslint-disable playwright/no-conditional-in-test */
 import { test, expect } from '@playwright/test';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
+// @ts-expect-error - 'generate-schema' is not typed, so we ignore the TS error.
 import GenerateSchema from 'generate-schema';
 import * as path from 'path';
 
-// Configuration
-if (process.argv.includes('--update-snapshots') && !process.env.SCHEMA) {
-	process.env.SCHEMA = 'true';
-}
+// --- Configuration ---
+const IGNORE_SKIPLIST = process.env.IGNORE_SKIPLIST === 'true';
 const SCHEMA_MODE = process.env.SCHEMA === 'true';
-const WORKFLOW_CONFIG_PATH = path.join(__dirname, 'workflowConfig.json');
 const WORKFLOWS_DIR = path.join(__dirname, '../test-workflows/workflows');
+const WORKFLOW_CONFIG_PATH = path.join(__dirname, 'workflowConfig.json');
 
-interface WorkflowConfig {
+interface Workflow {
+	id: string;
+	name: string;
+	status: 'SKIPPED' | 'ACTIVE';
+	enableSchemaValidation: boolean;
+}
+
+interface WorkflowConfigItem {
 	workflowId: string;
 	status: 'SKIPPED' | 'ACTIVE';
 	enableSchemaValidation?: boolean;
 }
 
-/**
- * Load workflow configuration
- * @returns A map of workflow IDs to their config
- */
-function getWorkflowConfig(): Map<string, WorkflowConfig> {
-	if (!fs.existsSync(WORKFLOW_CONFIG_PATH)) return new Map();
-
-	const configs: WorkflowConfig[] = JSON.parse(fs.readFileSync(WORKFLOW_CONFIG_PATH, 'utf-8'));
-	return new Map(configs.map((config) => [config.workflowId, config]));
+interface ExecutionResult {
+	success: boolean;
+	data: any;
+	error?: string;
 }
 
+// --- Helper Functions ---
+
 /**
- * Load workflows with their config
- * @returns An array of workflow objects with their config
+ * Loads and merges workflow files with their configurations from `workflowConfig.json`.
+ * @returns An array of workflow objects ready for testing.
  */
-function getWorkflowsWithConfig() {
+function loadWorkflows(): Workflow[] {
 	if (!fs.existsSync(WORKFLOWS_DIR)) return [];
 
-	const workflowConfigs = getWorkflowConfig();
+	const configs = new Map<string, WorkflowConfigItem>();
+	if (fs.existsSync(WORKFLOW_CONFIG_PATH)) {
+		const rawConfigs: WorkflowConfigItem[] = JSON.parse(
+			fs.readFileSync(WORKFLOW_CONFIG_PATH, 'utf-8'),
+		);
+		rawConfigs.forEach((c) => configs.set(c.workflowId, c));
+	}
 
 	return fs
 		.readdirSync(WORKFLOWS_DIR)
 		.filter((file) => file.endsWith('.json'))
 		.map((file) => {
-			const id = file.replace('.json', '');
+			const id = path.basename(file, '.json');
 			const content = JSON.parse(fs.readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8'));
-			const config = workflowConfigs.get(id);
+			const config = configs.get(id);
 
 			return {
 				id,
@@ -59,64 +67,68 @@ function getWorkflowsWithConfig() {
 }
 
 /**
- * Execute a workflow and return the result
- * @param workflowId - The ID of the workflow to execute
- * @returns The result of the workflow execution
+ * Executes a workflow via the CLI and captures the structured output or error.
+ * @param workflowId - The ID of the workflow to execute.
+ * @returns An object containing the execution status, data, and any errors.
  */
-function executeWorkflow(workflowId: string) {
+function executeWorkflow(workflowId: string): ExecutionResult {
+	const command = `../../cli/bin/n8n execute --id="${workflowId}"`;
+	const options = {
+		encoding: 'utf-8' as const,
+		maxBuffer: 10 * 1024 * 1024,
+		env: { ...process.env, SKIP_STATISTICS_EVENTS: 'true' },
+	};
 	const divider = '====================================';
-	try {
-		const stdout = execSync(`../../cli/bin/n8n execute --id="${workflowId}"`, {
-			encoding: 'utf-8',
-			maxBuffer: 10 * 1024 * 1024,
-			env: { ...process.env, SKIP_STATISTICS_EVENTS: 'true' },
-		});
 
+	try {
+		const stdout = execSync(command, options);
 		const dividerIndex = stdout.indexOf(divider);
 
 		if (dividerIndex === -1) {
+			// Handles cases where execution finishes but may not produce structured JSON output.
 			return { success: stdout.includes('Execution was successful'), data: null };
 		}
 
-		const data = JSON.parse(stdout.substring(dividerIndex + divider.length));
-		return { success: true, data };
+		const jsonData = stdout.substring(dividerIndex + divider.length);
+		return { success: true, data: JSON.parse(jsonData) };
 	} catch (error: any) {
 		const stdout = error.stdout ?? '';
 		const dividerIndex = stdout.indexOf(divider);
+
+		// Try to parse specific error details from stdout if the divider is present.
 		if (dividerIndex !== -1) {
 			const errorDetails = stdout.substring(dividerIndex + divider.length).trim();
 			return { success: false, data: null, error: errorDetails };
 		}
 
+		// Fallback to the generic error message from the caught exception.
 		return { success: false, data: null, error: error.message };
 	}
 }
 
-// Run tests
+// --- Test Suite ---
 test.describe('Workflow Tests', () => {
-	const workflows = getWorkflowsWithConfig();
+	const workflows = loadWorkflows();
 
 	for (const workflow of workflows) {
-		if (workflow.status === 'SKIPPED') {
-			// eslint-disable-next-line playwright/no-skipped-test
-			test.skip(`${workflow.name} (ID: ${workflow.id})`, () => {});
-			continue;
-		}
-
 		test(`${workflow.name} (ID: ${workflow.id})`, ({}, testInfo) => {
-			// Keep the snapshot name the same for all workflows, since it's not OS dependent
+			// Conditionally skip the test based on its status in the config file.
+			// This can be overridden by setting the IGNORE_SKIPLIST environment variable.
+			// eslint-disable-next-line playwright/no-skipped-test
+			test.skip(
+				workflow.status === 'SKIPPED' && !IGNORE_SKIPLIST,
+				'Workflow is marked as SKIPPED in workflowConfig.json',
+			);
+			// Standardize snapshot names to be consistent across different operating systems.
 			testInfo.snapshotSuffix = '';
 
-			// Execute the workflow
 			const result = executeWorkflow(workflow.id);
 
-			// Always verify the workflow executed successfully
-			expect(result.success, result.error).toBe(true);
+			expect(result.success, `Workflow execution failed: ${result.error}`).toBe(true);
 
-			// If schema mode is enabled and this workflow has schema validation enabled
+			// Optionally, validate the output against a JSON schema snapshot if enabled.
 			if (SCHEMA_MODE && result.data && workflow.enableSchemaValidation) {
 				const schema = GenerateSchema.json(result.data);
-
 				expect(JSON.stringify(schema, null, 2)).toMatchSnapshot(
 					`workflow-${workflow.id}-schema.snap`,
 				);
